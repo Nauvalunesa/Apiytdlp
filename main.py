@@ -484,6 +484,7 @@ async def download_audio(
     mode: str = Query("url"),
     bitrate: int = Query(128, ge=32, le=320, description="Bitrate MP3 kbps"),
 ):
+    
     if mode not in ["url", "buffer"]:
         return JSONResponse(status_code=400, content={"error": "Mode unduhan tidak valid. Gunakan 'url' atau 'buffer'."})
     try:
@@ -504,6 +505,7 @@ async def download_audio(
         mp3_filename = f"{sanitize_filename(info['title'])}_audio_downloadbynauval.mp3"
         mp3_path = os.path.join(OUTPUT_DIR, mp3_filename)
 
+        
         if not os.path.exists(src_path):
             candidates = [
                 os.path.join(OUTPUT_DIR, f"{sanitize_filename(info['title'])}_audio_src.{src_ext}"),
@@ -511,28 +513,43 @@ async def download_audio(
             ]
             src_path = next((p for p in candidates if os.path.exists(p)), None)
 
-        if src_path and os.path.exists(src_path):
-            pass
-        else:
-            with yt_dlp.YoutubeDL({"outtmpl": out_template}) as y:
-                guessed = y.prepare_filename(info)
-            src_path = guessed if os.path.exists(guessed) else None
-
         if not src_path or not os.path.exists(src_path):
             return JSONResponse(status_code=500, content={"error": "File sumber audio tidak ditemukan setelah unduhan."})
+
+    
+        file_size = os.path.getsize(src_path)
+        max_size = 25 * 1024 * 1024  # 25 MB
+        if file_size > max_size:
+            
+            background_tasks.add_task(delete_file_after_delay, src_path)
+
+            if mode == "url":
+                return JSONResponse(
+                    content={
+                        "title": info["title"],
+                        "filesize": file_size,
+                        "note": "File >25MB, dikirim dalam format asli",
+                        "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(os.path.basename(src_path))}",
+                        "status": "Success",
+                    }
+                )
+
+            with open(src_path, "rb") as f:
+                audio_buffer = io.BytesIO(f.read())
+            return StreamingResponse(
+                audio_buffer,
+                media_type=f"audio/{src_ext}",
+                headers={"Content-Disposition": f"attachment; filename={os.path.basename(src_path)}"},
+            )
 
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-y",
-            "-i",
-            src_path,
+            "-i", src_path,
             "-vn",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            "-b:a",
-            f"{bitrate}k",
+            "-ar", "44100",
+            "-ac", "2",
+            "-b:a", f"{bitrate}k",
             mp3_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
