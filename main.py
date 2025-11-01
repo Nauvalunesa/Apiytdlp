@@ -20,6 +20,9 @@ import platform
 import time
 from typing import Union, Literal
 from zipfile import ZipFile
+import shutil
+import tempfile
+import uuid
 
 SPOTIFY_CLIENT_ID = "isitokenkalian ambil di Spotify developer"
 SPOTIFY_CLIENT_SECRET = "isitokenkalian ambil di Spotify developer"
@@ -72,6 +75,50 @@ app.add_middleware(
 
 def sanitize_filename(filename: str) -> str:
     return "".join(c if ord(c) < 128 else "_" for c in filename)
+
+async def create_temp_cookies_file() -> str:
+    """Create a temporary copy of cookies file to prevent yt-dlp from modifying the original"""
+    temp_dir = tempfile.gettempdir()
+    temp_cookies_path = os.path.join(temp_dir, f"yt_cookies_{uuid.uuid4().hex}.txt")
+
+    def _copy():
+        if os.path.exists(COOKIES_FILE):
+            shutil.copy2(COOKIES_FILE, temp_cookies_path)
+        else:
+            # Create empty file if original doesn't exist
+            open(temp_cookies_path, 'a').close()
+        return temp_cookies_path
+
+    return await asyncio.to_thread(_copy)
+
+async def cleanup_temp_cookies(cookies_path: str):
+    """Delete temporary cookies file"""
+    def _delete():
+        try:
+            if os.path.exists(cookies_path):
+                os.remove(cookies_path)
+        except Exception as e:
+            logger.warning(f"Failed to delete temp cookies: {e}")
+    await asyncio.to_thread(_delete)
+
+async def get_video_duration(file_path: str) -> int:
+    """Get video/audio duration in seconds using ffprobe"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        duration = float(stdout.decode().strip())
+        return int(duration)
+    except Exception as e:
+        logger.error(f"Failed to get duration for {file_path}: {e}")
+        return 0
 
 async def delete_file_after_delay(file_path: str, delay: int = 600):
     await asyncio.sleep(delay)
@@ -197,11 +244,23 @@ async def douyin_download(url: str = Query(..., description="URL video Douyin"))
         logger.error(f"douyin_download | URL: {url} | Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-async def ytdlp_extract(opts: dict, query: str, download: bool):
-    def _run():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(query, download=download)
-    return await asyncio.to_thread(_run)
+async def ytdlp_extract(opts: dict, query: str, download: bool, use_temp_cookies: bool = True):
+    """Extract info using yt-dlp with optional temporary cookies"""
+    temp_cookies = None
+    try:
+        if use_temp_cookies and "cookiefile" in opts:
+            temp_cookies = await create_temp_cookies_file()
+            opts = opts.copy()
+            opts["cookiefile"] = temp_cookies
+
+        def _run():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(query, download=download)
+
+        return await asyncio.to_thread(_run)
+    finally:
+        if temp_cookies:
+            await cleanup_temp_cookies(temp_cookies)
 
 @app.get("/search/", summary="Pencarian Video/Musik/Playlist YouTube")
 async def search_video(
@@ -477,17 +536,37 @@ async def download_with_subtitle(
         logger.error(f"download/with-sub | URL: {url} | Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.get("/download/audio/", summary="Unduhan Audio YouTube")
+@app.get("/download/audio/", summary="Unduhan Audio YouTube (Max 45 menit, dikonversi ke MP3)")
 async def download_audio(
     background_tasks: BackgroundTasks,
     url: str = Query(...),
     mode: str = Query("url"),
     bitrate: int = Query(128, ge=32, le=320, description="Bitrate MP3 kbps"),
 ):
-    
     if mode not in ["url", "buffer"]:
         return JSONResponse(status_code=400, content={"error": "Mode unduhan tidak valid. Gunakan 'url' atau 'buffer'."})
     try:
+        # Get info first to check duration
+        info_opts = {
+            "quiet": True,
+            "cookiefile": COOKIES_FILE,
+            "no_warnings": True,
+        }
+        info = await ytdlp_extract(info_opts, url, download=False)
+
+        # Check duration (45 minutes = 2700 seconds)
+        duration = info.get("duration", 0)
+        MAX_DURATION = 45 * 60  # 45 minutes in seconds
+
+        if duration and duration > MAX_DURATION:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Audio terlalu panjang. Maksimal 45 menit. Durasi video: {duration // 60} menit {duration % 60} detik"
+                }
+            )
+
+        # Download audio
         out_template = os.path.join(OUTPUT_DIR, "%(title)s_audio_src.%(ext)s")
         ydl_opts = {
             "outtmpl": out_template,
@@ -505,7 +584,7 @@ async def download_audio(
         mp3_filename = f"{sanitize_filename(info['title'])}_audio_downloadbynauval.mp3"
         mp3_path = os.path.join(OUTPUT_DIR, mp3_filename)
 
-        
+        # Find source file
         if not os.path.exists(src_path):
             candidates = [
                 os.path.join(OUTPUT_DIR, f"{sanitize_filename(info['title'])}_audio_src.{src_ext}"),
@@ -516,31 +595,8 @@ async def download_audio(
         if not src_path or not os.path.exists(src_path):
             return JSONResponse(status_code=500, content={"error": "File sumber audio tidak ditemukan setelah unduhan."})
 
-    
-        file_size = os.path.getsize(src_path)
-        max_size = 25 * 1024 * 1024  # 25 MB
-        if file_size > max_size:
-            
-            background_tasks.add_task(delete_file_after_delay, src_path)
-
-            if mode == "url":
-                return JSONResponse(
-                    content={
-                        "title": info["title"],
-                        "filesize": file_size,
-                        "note": "File >25MB, dikirim dalam format asli",
-                        "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(os.path.basename(src_path))}",
-                        "status": "Success",
-                    }
-                )
-
-            with open(src_path, "rb") as f:
-                audio_buffer = io.BytesIO(f.read())
-            return StreamingResponse(
-                audio_buffer,
-                media_type=f"audio/{src_ext}",
-                headers={"Content-Disposition": f"attachment; filename={os.path.basename(src_path)}"},
-            )
+        # Always convert to MP3
+        logger.info(f"Converting audio to MP3: {src_path} -> {mp3_path}")
 
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -556,6 +612,7 @@ async def download_audio(
         )
         await proc.communicate()
 
+        # Cleanup source file
         try:
             os.remove(src_path)
         except Exception:
@@ -573,6 +630,8 @@ async def download_audio(
                     "title": info["title"],
                     "filesize": file_size,
                     "bitrate": bitrate,
+                    "duration_seconds": duration,
+                    "format": "MP3",
                     "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(os.path.basename(mp3_path))}",
                     "status": "Success",
                 }
@@ -626,22 +685,38 @@ async def download_playlist(
 
         downloaded_files: list[dict] = []
 
-        def _download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                entries = info.get("entries", [])
-                for idx, entry in enumerate(entries, start=1):
-                    filepath = ydl.prepare_filename(entry)
-                    if os.path.exists(filepath):
-                        downloaded_files.append(
-                            {
-                                "index": idx,
-                                "title": entry.get("title"),
-                                "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(os.path.basename(filepath))}",
-                            }
-                        )
-                        background_tasks.add_task(delete_file_after_delay, filepath)
-        await asyncio.to_thread(_download)
+        # Fully async download process
+        async def _download():
+            temp_cookies = await create_temp_cookies_file()
+            try:
+                ydl_opts_copy = ydl_opts.copy()
+                ydl_opts_copy["cookiefile"] = temp_cookies
+
+                def _run():
+                    with yt_dlp.YoutubeDL(ydl_opts_copy) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        entries = info.get("entries", [])
+                        result = []
+                        for idx, entry in enumerate(entries, start=1):
+                            filepath = ydl.prepare_filename(entry)
+                            if os.path.exists(filepath):
+                                result.append({
+                                    "index": idx,
+                                    "title": entry.get("title"),
+                                    "filepath": filepath,
+                                })
+                        return result
+
+                return await asyncio.to_thread(_run)
+            finally:
+                await cleanup_temp_cookies(temp_cookies)
+
+        results = await _download()
+        for item in results:
+            filepath = item.pop("filepath")
+            item["download_url"] = f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(os.path.basename(filepath))}"
+            downloaded_files.append(item)
+            background_tasks.add_task(delete_file_after_delay, filepath)
 
         return {"playlist_title": f"Download hasil playlist dari: {url}", "total_videos": len(downloaded_files), "videos": downloaded_files}
     except Exception as e:
@@ -955,57 +1030,73 @@ async def spotify_download_playlist_audio(
 
         downloaded: list[dict] = []
 
-        def _download_all():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                for idx, track in enumerate(all_tracks, start=1):
-                    query = f"{track['title']} {track['artist']} audio"
+        async def _download_all_async():
+            temp_cookies = await create_temp_cookies_file()
+            try:
+                ydl_opts_copy = ydl_opts.copy()
+                ydl_opts_copy["cookiefile"] = temp_cookies
+
+                def _extract_and_download():
+                    with yt_dlp.YoutubeDL(ydl_opts_copy) as ydl:
+                        results = []
+                        for idx, track in enumerate(all_tracks, start=1):
+                            query = f"{track['title']} {track['artist']} audio"
+                            try:
+                                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+                                entry = info["entries"][0] if "entries" in info else info
+                                base = sanitize_filename(entry["title"])
+                                src_out = os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.%(ext)s")
+                                ydl.params["outtmpl"] = src_out
+                                ydl.download([entry["webpage_url"]])
+
+                                candidates = [
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.webm"),
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.m4a"),
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.mp3"),
+                                ]
+                                src_path = next((p for p in candidates if os.path.exists(p)), None)
+                                if src_path:
+                                    results.append({
+                                        "idx": idx,
+                                        "track": track,
+                                        "src_path": src_path,
+                                        "base": base,
+                                    })
+                            except Exception as e:
+                                logger.warning(f"Gagal unduh lagu: {query} | Error: {e}")
+                        return results
+
+                download_results = await asyncio.to_thread(_extract_and_download)
+
+                # Convert to MP3 using async subprocess
+                for result in download_results:
+                    out_name = f"{result['base']}_spotify_playlist.mp3"
+                    out_path = os.path.join(OUTPUT_DIR, out_name)
+
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", result['src_path'], "-vn", "-ar", "44100",
+                        "-ac", "2", "-b:a", f"{bitrate}k", out_path,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+
                     try:
-                        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                        entry = info["entries"][0] if "entries" in info else info
-                        base = sanitize_filename(entry["title"])
-                        src_out = os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.%(ext)s")
-                        ydl.params["outtmpl"] = src_out
-                        ydl.download([entry["webpage_url"]])
+                        os.remove(result['src_path'])
+                    except Exception:
+                        pass
 
-                        candidates = [
-                            os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.webm"),
-                            os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.m4a"),
-                            os.path.join(OUTPUT_DIR, f"{base}_spotify_playlist_src.mp3"),
-                        ]
-                        src_path = next((p for p in candidates if os.path.exists(p)), None)
-                        if not src_path:
-                            continue
+                    if os.path.exists(out_path):
+                        downloaded.append({
+                            "index": result['idx'],
+                            "title": result['track']["title"],
+                            "artist": result['track']["artist"],
+                            "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(out_name)}",
+                        })
+            finally:
+                await cleanup_temp_cookies(temp_cookies)
 
-                        out_name = f"{base}_spotify_playlist.mp3"
-                        out_path = os.path.join(OUTPUT_DIR, out_name)
-
-                        asyncio.run(asyncio.create_task(asyncio.sleep(0)))
-
-                        proc = subprocess.Popen(
-                            ["ffmpeg", "-y", "-i", src_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", out_path],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                        )
-                        proc.wait()
-
-                        try:
-                            os.remove(src_path)
-                        except Exception:
-                            pass
-
-                        if os.path.exists(out_path):
-                            downloaded.append(
-                                {
-                                    "index": idx,
-                                    "title": track["title"],
-                                    "artist": track["artist"],
-                                    "download_url": f"https://ytdlpyton.nvlgroup.my.id/download/file/{quote(out_name)}",
-                                }
-                            )
-                    except Exception as e:
-                        logger.warning(f"Gagal unduh lagu: {query} | Error: {e}")
-
-        await asyncio.to_thread(_download_all)
+        await _download_all_async()
         for item in downloaded:
             filename = item["download_url"].split("/file/")[-1]
             background_tasks.add_task(delete_file_after_delay, os.path.join(OUTPUT_DIR, filename))
@@ -1068,45 +1159,65 @@ async def spotify_full_playlist_download(
 
         downloaded_files: list[str] = []
 
-        def _download_tracks():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                for track in all_tracks:
-                    query = f"{track['title']} {track['artist']} audio"
+        async def _download_tracks_async():
+            temp_cookies = await create_temp_cookies_file()
+            try:
+                ydl_opts_copy = ydl_opts.copy()
+                ydl_opts_copy["cookiefile"] = temp_cookies
+
+                def _extract_and_download():
+                    with yt_dlp.YoutubeDL(ydl_opts_copy) as ydl:
+                        results = []
+                        for track in all_tracks:
+                            query = f"{track['title']} {track['artist']} audio"
+                            try:
+                                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+                                entry = info["entries"][0] if "entries" in info else info
+                                base = sanitize_filename(entry["title"])
+                                src_out = os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.%(ext)s")
+                                ydl.params["outtmpl"] = src_out
+                                ydl.download([entry["webpage_url"]])
+
+                                candidates = [
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.webm"),
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.m4a"),
+                                    os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.mp3"),
+                                ]
+                                src_path = next((p for p in candidates if os.path.exists(p)), None)
+                                if src_path:
+                                    results.append({
+                                        "src_path": src_path,
+                                        "base": base,
+                                    })
+                            except Exception as e:
+                                logger.warning(f"Gagal unduh: {query} | Error: {e}")
+                        return results
+
+                download_results = await asyncio.to_thread(_extract_and_download)
+
+                # Convert to MP3 using async subprocess
+                for result in download_results:
+                    out_path = os.path.join(OUTPUT_DIR, f"{result['base']}_spotifyfull.mp3")
+
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", result['src_path'], "-vn", "-ar", "44100",
+                        "-ac", "2", "-b:a", f"{bitrate}k", out_path,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+
                     try:
-                        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                        entry = info["entries"][0] if "entries" in info else info
-                        base = sanitize_filename(entry["title"])
-                        src_out = os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.%(ext)s")
-                        ydl.params["outtmpl"] = src_out
-                        ydl.download([entry["webpage_url"]])
+                        os.remove(result['src_path'])
+                    except Exception:
+                        pass
 
-                        candidates = [
-                            os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.webm"),
-                            os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.m4a"),
-                            os.path.join(OUTPUT_DIR, f"{base}_spotifyfull_src.mp3"),
-                        ]
-                        src_path = next((p for p in candidates if os.path.exists(p)), None)
-                        if not src_path:
-                            continue
+                    if os.path.exists(out_path):
+                        downloaded_files.append(out_path)
+            finally:
+                await cleanup_temp_cookies(temp_cookies)
 
-                        out_path = os.path.join(OUTPUT_DIR, f"{base}_spotifyfull.mp3")
-                        proc = subprocess.Popen(
-                            ["ffmpeg", "-y", "-i", src_path, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", out_path],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                        )
-                        proc.wait()
-                        try:
-                            os.remove(src_path)
-                        except Exception:
-                            pass
-
-                        if os.path.exists(out_path):
-                            downloaded_files.append(out_path)
-                    except Exception as e:
-                        logger.warning(f"Gagal unduh: {query} | Error: {e}")
-
-        await asyncio.to_thread(_download_tracks)
+        await _download_tracks_async()
 
         if mode == "url":
             for f in downloaded_files:
