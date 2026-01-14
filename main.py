@@ -396,6 +396,7 @@ async def download_video(
             "merge_output_format": "mp4",
             "quiet": True,
             "noplaylist": True,
+            "remote_components": ["ejs:github"]
         }
         info = await ytdlp_extract(ydl_opts, url, download=True)
 
@@ -477,6 +478,7 @@ async def download_with_subtitle(
                 "postprocessors": [
                     {"key": "FFmpegSubtitlesConvertor", "format": "srt"},
                     {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+                    "remote_components": ["ejs:github"]
                 ],
             }
             await ytdlp_extract(ydl_opts, url, download=True)
@@ -576,6 +578,7 @@ async def download_audio(
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "remote_components": ["ejs:github"]
         }
         info = await ytdlp_extract(ydl_opts, url, download=True)
 
@@ -679,6 +682,7 @@ async def download_playlist(
             "outtmpl": os.path.join(OUTPUT_DIR, "%(title)s.%(ext)s"),
             "format": ydl_format,
             "noplaylist": False,
+            "remote_components": ["ejs:github"]
         }
         if merge_output:
             ydl_opts["merge_output_format"] = merge_output
@@ -907,6 +911,7 @@ async def spotify_download_from_track_show_episode(
             "prefer_ffmpeg": True,
             "noplaylist": True,
             "no_warnings": True,
+            "remote_components": ["ejs:github"]
         }
         info = await ytdlp_extract(ydl_opts, f"ytsearch1:{search_query}", download=False)
         entry = info["entries"][0] if "entries" in info else info
@@ -1026,6 +1031,7 @@ async def spotify_download_playlist_audio(
             "prefer_ffmpeg": True,
             "noplaylist": True,
             "no_warnings": True,
+            "remote_components": ["ejs:github"]
         }
 
         downloaded: list[dict] = []
@@ -1155,6 +1161,7 @@ async def spotify_full_playlist_download(
             "prefer_ffmpeg": True,
             "noplaylist": True,
             "no_warnings": True,
+            "remote_components": ["ejs:github"]
         }
 
         downloaded_files: list[str] = []
