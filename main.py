@@ -472,13 +472,13 @@ async def download_with_subtitle(
                 "writeautomaticsub": True,
                 "subtitleslangs": [lang],
                 "skip_download": False,
+                "remote_components": ["ejs:github"]
                 "outtmpl": os.path.join(OUTPUT_DIR, filename_base + ".%(ext)s"),
                 "format": f"bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
                 "merge_output_format": "mp4",
                 "postprocessors": [
                     {"key": "FFmpegSubtitlesConvertor", "format": "srt"},
-                    {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-                    "remote_components": ["ejs:github"]
+                    {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
                 ],
             }
             await ytdlp_extract(ydl_opts, url, download=True)
